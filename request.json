@@ -11,6 +11,10 @@
   },
   "preferences": {
     "soft_geo_boost": true,
-    "soft_language_boost": true
+    "soft_language_boost": true,
+    "avoid_safety_labels": [
+      "adult",
+      "controversy"
+    ]
   }
 }

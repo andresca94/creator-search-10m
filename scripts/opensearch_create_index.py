@@ -1,11 +1,21 @@
 from opensearchpy import OpenSearch
 
 INDEX = "creators_v1"
+ADMIN_USER = "admin"
+ADMIN_PASS = "ChangeThis_ToA_StrongPassword_123!"
+
+def make_client() -> OpenSearch:
+    return OpenSearch(
+        hosts=[{"host": "localhost", "port": 9200}],
+        http_auth=(ADMIN_USER, ADMIN_PASS),
+        use_ssl=True,
+        verify_certs=False,
+        ssl_show_warn=False,
+    )
 
 def main():
-    client = OpenSearch(hosts=["http://localhost:9200"])
+    client = make_client()
 
-    # NOTE: must use keyword arg `index=...`
     if client.indices.exists(index=INDEX):
         client.indices.delete(index=INDEX)
 
@@ -16,12 +26,7 @@ def main():
                 "creator_id": {"type": "keyword"},
                 "name": {"type": "keyword"},
                 "language": {"type": "keyword"},
-                "location": {
-                    "properties": {
-                        "country": {"type": "keyword"},
-                        "city": {"type": "keyword"},
-                    }
-                },
+                "location": {"properties": {"country": {"type": "keyword"}, "city": {"type": "keyword"}}},
                 "verticals": {"type": "keyword"},
                 "keywords": {"type": "keyword"},
                 "bio": {"type": "text"},
@@ -38,7 +43,6 @@ def main():
         },
     }
 
-    # NOTE: must use keyword arg `index=...`
     client.indices.create(index=INDEX, body=body)
     print("Created index", INDEX)
 
