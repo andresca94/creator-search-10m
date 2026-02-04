@@ -1,0 +1,16 @@
+{
+  "description": "Creators that talk about football and music. Prefer English US creators. Avoid adult/controversy.",
+  "hard_constraints": {
+    "min_followers": 1000000,
+    "geo": {
+      "country": "US"
+    },
+    "languages": [
+      "en"
+    ]
+  },
+  "preferences": {
+    "soft_geo_boost": true,
+    "soft_language_boost": true
+  }
+}
