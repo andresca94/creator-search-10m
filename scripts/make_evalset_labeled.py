@@ -2,258 +2,221 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
-import re
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from opensearchpy import OpenSearch
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# ---------------------------------------------------------------------
+# GOLD + labels generated with a *teacher* that matches (or extends) runtime
+# Runtime = OpenSearch retrieve + Linear rerank
+# Teacher  = Runtime + Cross-Encoder rerank on top-M
+#
+# Additionally:
+# - hard negatives: include “high linear, low teacher” items in the labeled pool
+# - label noise: flip a small % of labels up/down for realism
+#
+# IMPORTANT: Cross-Encoder must be cached/loaded ONCE per run, not per query.
+# ---------------------------------------------------------------------
 
-# ----------------------------
-# OpenSearch config (defaults)
-# ----------------------------
+from creator_search.constraints import parse_constraints
+from creator_search.search import build_os_query as build_os_query_runtime
+from creator_search.features import build_feature_vector
+from creator_search.rerank import load_reranker, LinearReranker
+from creator_search.recency import compute_recency_score
+
+from creator_search.cross_encoder import (
+    CrossEncoderConfig,
+    get_cross_encoder,
+    rerank_with_cross_encoder,
+)
+
 OPENSEARCH_URL_DEFAULT = "https://localhost:9200"
 OPENSEARCH_USER_DEFAULT = "admin"
 OPENSEARCH_PASS_DEFAULT = "ChangeThis_ToA_StrongPassword_123!"
 INDEX_DEFAULT = "creators_v1"
 
-# When your simulator injects fixtures like cr_gold_1/cr_gold_2 and hard cases,
-# we usually want to EXCLUDE them from "gold" so evaluation is on real corpus.
 EXCLUDE_ID_PREFIXES_DEFAULT = ["cr_gold_", "cr_hard_"]
 
 
 # ----------------------------
-# Basic parsing helpers
+# IO helpers
 # ----------------------------
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+    return out
 
 
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def tokenize(text: str) -> List[str]:
-    return _TOKEN_RE.findall((text or "").lower())
-
-
-def parse_iso_ts(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def clamp01(x: float) -> float:
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
-
-
-def normalize01(vals: List[float]) -> List[float]:
-    if not vals:
-        return []
-    mn = min(vals)
-    mx = max(vals)
-    if mx == mn:
-        return [0.0 for _ in vals]
-    return [(v - mn) / (mx - mn) for v in vals]
-
-
-# ----------------------------
-# Heuristic relevance model
-# ----------------------------
-SAFETY_WEIGHTS = {
-    "adult": 0.6,
-    "controversy": 0.4,
-    "politics": 0.25,
-    "drugs": 0.35,
-    "violence": 0.35,
-}
-
-
-@dataclass
-class ParsedRequest:
-    description: str
-    min_followers: int
-    geo_country: Optional[str]
-    languages: List[str]
-    preferences: Dict[str, Any]
-
-
-def parse_request(req: Dict[str, Any]) -> ParsedRequest:
-    desc = (req.get("description") or "").strip()
-    hc = req.get("hard_constraints", {}) or {}
-    prefs = req.get("preferences", {}) or {}
-
-    min_followers = safe_int(hc.get("min_followers"), 0)
-
-    geo = hc.get("geo") or {}
-    geo_country = None
-    if isinstance(geo, dict):
-        geo_country = geo.get("country") or None
-        if geo_country:
-            geo_country = str(geo_country).upper()
-
-    langs = hc.get("languages") or []
-    if not isinstance(langs, list):
-        langs = []
-    languages = [str(x).lower() for x in langs if x]
-
-    return ParsedRequest(
-        description=desc,
-        min_followers=min_followers,
-        geo_country=geo_country,
-        languages=languages,
-        preferences=dict(prefs),
+def make_client(url: str, user: str, password: str) -> OpenSearch:
+    return OpenSearch(
+        url,
+        http_auth=(user, password),
+        use_ssl=True,
+        verify_certs=False,
+        ssl_show_warn=False,
+        timeout=60,
+        max_retries=2,
+        retry_on_timeout=True,
     )
 
 
-def creator_text(profile: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    parts.extend(profile.get("verticals") or [])
-    parts.extend(profile.get("keywords") or [])
-    parts.append(profile.get("bio") or "")
-
-    # recent posts: caption/hashtags/transcript
-    for post in (profile.get("recent_posts") or []):
-        parts.append(str(post.get("caption", "")))
-        for h in (post.get("hashtags") or []):
-            parts.append(str(h))
-        parts.append(str(post.get("transcript", "")))
-
-    return " ".join(parts)
+def is_excluded_id(cid: str, exclude_prefixes: List[str]) -> bool:
+    c = cid or ""
+    for p in exclude_prefixes:
+        if c.startswith(p):
+            return True
+    return False
 
 
-def compute_recency01(profile: Dict[str, Any], now_utc: datetime, half_life_days: float = 14.0) -> float:
+# ----------------------------
+# Runtime scoring (linear)
+# ----------------------------
+def linear_score_hits(
+    hits: List[Dict[str, Any]],
+    request_meta: Dict[str, Any],
+    reranker: LinearReranker,
+) -> List[Dict[str, Any]]:
     """
-    recency_01 in [0,1] using exponential decay on the most recent post age:
-      recency = exp(-ln(2) * age_days / half_life_days)
+    Score OpenSearch hits using the SAME feature extraction + linear reranker as runtime.
+    Returns list sorted by linear score desc.
+    Each element includes:
+      - creator_id
+      - linear_score
+      - bm25_score
+      - _source  (for CE doc text)
+      - _hit     (raw OS hit)
     """
-    newest: Optional[datetime] = None
-    for post in (profile.get("recent_posts") or []):
-        ts = parse_iso_ts(str(post.get("timestamp") or ""))
-        if ts is None:
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        src = h.get("_source") or {}
+        cid = str(src.get("creator_id") or "")
+        if not cid:
             continue
-        if newest is None or ts > newest:
-            newest = ts
 
-    if newest is None:
-        return 0.0
+        # Ensure recency_score exists for features.py (if your index stores it, no-op)
+        if "recency_score" not in src:
+            src["recency_score"] = compute_recency_score(src.get("recent_posts") or [])
 
-    age_days = max((now_utc - newest).total_seconds() / 86400.0, 0.0)
-    lam = math.log(2.0) / max(half_life_days, 1e-6)
-    return float(math.exp(-lam * age_days))
+        feats = build_feature_vector(h, request_meta=request_meta)
+        s = float(reranker.score(feats))
 
+        out.append(
+            {
+                "creator_id": cid,
+                "linear_score": s,
+                "bm25_score": float(h.get("_score") or 0.0),
+                "_source": src,
+                "_hit": h,
+            }
+        )
 
-def compute_engagement_raw(profile: Dict[str, Any]) -> float:
-    followers = math.log1p(max(safe_int(profile.get("follower_count"), 0), 0))
-    er = safe_float(profile.get("engagement_rate_30d"), 0.0)
-    views = math.log1p(max(safe_int(profile.get("avg_views_30d"), 0), 0))
-    return 0.6 * followers + 0.3 * er + 0.1 * views
-
-
-def compute_safety_penalty(profile: Dict[str, Any], avoid_labels: List[str]) -> float:
-    labels = set([str(x).lower() for x in (profile.get("content_safety_labels") or []) if x])
-    avoid = set([str(x).lower() for x in (avoid_labels or []) if x])
-
-    pen = 0.0
-    for lab in labels:
-        pen += SAFETY_WEIGHTS.get(lab, 0.0)
-
-    for lab in (labels & avoid):
-        pen += 0.35
-
-    if bool(profile.get("is_suspected_spam") or False):
-        pen += 0.8
-
-    auth = profile.get("authenticity_score")
-    if auth is not None:
-        a = safe_float(auth, 1.0)
-        pen += max(0.0, 0.6 - a)
-
-    return clamp01(pen)
+    out.sort(key=lambda x: float(x["linear_score"]), reverse=True)
+    return out
 
 
-def lexical_match01(query: str, doc: str) -> float:
-    qt = set(tokenize(query))
-    dt = set(tokenize(doc))
-    if not qt or not dt:
-        return 0.0
-    inter = len(qt & dt)
-    union = len(qt | dt)
-    j = inter / union if union else 0.0
-    return clamp01(j * 1.5)
+# ----------------------------
+# Teacher scoring (CE)
+# ----------------------------
+def teacher_rerank_with_ce(
+    query: str,
+    linear_ranked: List[Dict[str, Any]],
+    ce_model: str,
+    ce_rerank_k: int,
+    ce_batch_size: int,
+    ce_max_length: int,
+    ce_alpha: float,
+    ce_device: str,
+) -> List[Dict[str, Any]]:
+    """
+    Uses CE on top-M (by linear), combines with linear via alpha, returns sorted list.
+
+    We reuse creator_search.cross_encoder.rerank_with_cross_encoder().
+    That helper expects "hits" entries to look like runtime ranked dicts with:
+      - final_score (we'll feed linear_score as final_score)
+      - _source (doc text)
+      - creator_id
+    """
+    # Build the hits shape expected by rerank_with_cross_encoder
+    shaped = []
+    for x in linear_ranked:
+        shaped.append(
+            {
+                "creator_id": x["creator_id"],
+                "final_score": float(x["linear_score"]),  # base score
+                "bm25_score": float(x.get("bm25_score", 0.0)),
+                "_source": x["_source"],
+            }
+        )
+
+    cfg = CrossEncoderConfig(
+        model_name=str(ce_model),
+        batch_size=int(ce_batch_size),
+        max_length=int(ce_max_length),
+        device=str(ce_device),
+    )
+    ce = get_cross_encoder(cfg)  # cached per-process
+
+    reranked = rerank_with_cross_encoder(
+        query=str(query),
+        hits=shaped,
+        top_m=int(ce_rerank_k),
+        ce=ce,
+        alpha=float(ce_alpha),
+    )
+
+    # rerank_with_cross_encoder returns a list sorted by new final_score desc
+    return reranked
 
 
-def geo_lang_match(profile: Dict[str, Any], pr: ParsedRequest) -> Tuple[float, float]:
-    geo_match = 1.0
-    if pr.geo_country:
-        loc = profile.get("location") or {}
-        c = (loc.get("country") or "")
-        geo_match = 1.0 if str(c).upper() == pr.geo_country else 0.0
+# ----------------------------
+# Labeling pool selection
+# ----------------------------
+def _pick_label_pool(
+    rnd: random.Random,
+    teacher_ranked: List[Dict[str, Any]],
+    linear_ranked: List[Dict[str, Any]],
+    label_pool_k: int,
+    hard_neg_k: int,
+) -> List[str]:
+    """
+    label pool = top label_pool_k by teacher score + hard negatives (high linear, low teacher)
 
-    lang_match = 1.0
-    if pr.languages:
-        lang = str(profile.get("language") or "").lower()
-        lang_match = 1.0 if lang in pr.languages else 0.0
+    Hard negatives definition:
+      candidates that are in top ~label_pool_k of linear but NOT in top ~label_pool_k of teacher
+      (and we add up to hard_neg_k of them).
+    """
+    label_pool_k = max(int(label_pool_k), 0)
+    hard_neg_k = max(int(hard_neg_k), 0)
 
-    return geo_match, lang_match
+    teacher_ids = [h["creator_id"] for h in teacher_ranked]
+    linear_ids = [h["creator_id"] for h in linear_ranked]
 
+    top_teacher = teacher_ids[:label_pool_k] if label_pool_k else []
+    top_teacher_set = set(top_teacher)
 
-def score_profile(profile: Dict[str, Any], pr: ParsedRequest, now_utc: datetime, eng01: float) -> Tuple[float, Dict[str, Any]]:
-    text = lexical_match01(pr.description, creator_text(profile))
-    rec = compute_recency01(profile, now_utc)
-    geo_m, lang_m = geo_lang_match(profile, pr)
+    # high-linear items not selected by teacher
+    candidates = [cid for cid in linear_ids[: max(label_pool_k, hard_neg_k, 1)] if cid not in top_teacher_set]
+    rnd.shuffle(candidates)
+    hard_negs = candidates[:hard_neg_k] if hard_neg_k else []
 
-    soft_geo = bool(pr.preferences.get("soft_geo_boost", True))
-    soft_lang = bool(pr.preferences.get("soft_language_boost", True))
-    avoid_labels = pr.preferences.get("avoid_safety_labels") or []
-
-    safety_pen = compute_safety_penalty(profile, avoid_labels)
-
-    geo_term = 0.05 * geo_m if soft_geo else 0.0
-    lang_term = 0.05 * lang_m if soft_lang else 0.0
-
-    base = 0.55 * text + 0.25 * eng01 + 0.15 * rec + geo_term + lang_term
-    score = base * (1.0 - 0.7 * safety_pen)
-
-    # min_followers treated as hard (score -> 0)
-    if pr.min_followers and safe_int(profile.get("follower_count"), 0) < pr.min_followers:
-        score = 0.0
-
-    explain = {
-        "features": {
-            "text_01": round(text, 6),
-            "eng_01": round(eng01, 6),
-            "recency_01": round(rec, 6),
-            "geo_match": geo_m,
-            "lang_match": lang_m,
-            "safety_penalty": round(safety_pen, 6),
-        },
-        "raw_base": round(base, 6),
-        "score": round(score, 6),
-    }
-    return score, explain
+    pool = list(dict.fromkeys(top_teacher + hard_negs))  # stable unique
+    return pool[: max(label_pool_k, 0) + max(hard_neg_k, 0)]
 
 
+# ----------------------------
+# Graded relevance + noise
+# ----------------------------
 def to_graded_relevance(scores: List[float]) -> List[float]:
+    """
+    Convert scores into {0,1,2,3} by query-local quantiles.
+    """
     if not scores:
         return []
     s_sorted = sorted(scores)
@@ -276,114 +239,41 @@ def to_graded_relevance(scores: List[float]) -> List[float]:
     return rel
 
 
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            out.append(json.loads(line))
+def apply_label_noise(
+    rnd: random.Random,
+    rel_map: Dict[str, float],
+    noise_down_p: float,
+    noise_up_p: float,
+) -> Dict[str, float]:
+    """
+    More realistic labels:
+      - noise_down_p: with this prob, demote strong positives (>=2) by 1 (2->1, 3->2)
+      - noise_up_p  : with this prob, promote negatives (0) to weak positive (1)
+
+    Keeps values in {0,1,2,3}.
+    """
+    nd = max(0.0, float(noise_down_p))
+    nu = max(0.0, float(noise_up_p))
+
+    out: Dict[str, float] = {}
+    for cid, r in rel_map.items():
+        rr = float(r)
+        if rr >= 2.0 and nd > 0 and rnd.random() < nd:
+            rr = max(0.0, rr - 1.0)
+        elif rr <= 0.0 and nu > 0 and rnd.random() < nu:
+            rr = 1.0
+        # clamp to {0,1,2,3}
+        rr = 0.0 if rr < 0.5 else 1.0 if rr < 1.5 else 2.0 if rr < 2.5 else 3.0
+        out[cid] = rr
     return out
 
 
 # ----------------------------
-# OpenSearch retrieval
+# Main
 # ----------------------------
-def make_client(url: str, user: str, password: str) -> OpenSearch:
-    return OpenSearch(
-        url,
-        http_auth=(user, password),
-        use_ssl=True,
-        verify_certs=False,
-        ssl_show_warn=False,
-        timeout=60,
-        max_retries=2,
-        retry_on_timeout=True,
-    )
-
-
-def build_os_query(req: Dict[str, Any], candidate_k: int) -> Dict[str, Any]:
-    """
-    Build an OpenSearch query from the request.
-    - min_followers = hard filter (range)
-    - description = must multi_match (bio/recent_text)
-    - geo/lang are NOT hard-filtered here (so we can still penalize instead of filtering),
-      but we can add mild should boosts.
-    """
-    pr = parse_request(req)
-
-    must: List[Dict[str, Any]] = []
-    filt: List[Dict[str, Any]] = []
-    should: List[Dict[str, Any]] = []
-
-    desc = pr.description
-    if desc:
-        must.append(
-            {
-                "multi_match": {
-                    "query": desc,
-                    "fields": ["bio", "recent_text"],
-                }
-            }
-        )
-    else:
-        must.append({"match_all": {}})
-
-    if pr.min_followers:
-        filt.append({"range": {"follower_count": {"gte": int(pr.min_followers)}}})
-
-    # Soft boosts (NOT filters)
-    if pr.geo_country:
-        should.append({"term": {"location.country": {"value": pr.geo_country, "boost": 1.2}}})
-    if pr.languages:
-        should.append({"terms": {"language": pr.languages}})
-
-    q = {
-        "size": candidate_k,
-        "track_total_hits": False,
-        "_source": {
-            "includes": [
-                "creator_id",
-                "name",
-                "language",
-                "location.country",
-                "location.city",
-                "verticals",
-                "keywords",
-                "bio",
-                "recent_text",
-                "follower_count",
-                "engagement_rate_30d",
-                "avg_views_30d",
-                "content_safety_labels",
-                "is_suspected_spam",
-                "authenticity_score",
-                "recent_posts",
-            ]
-        },
-        "query": {
-            "bool": {
-                "must": must,
-                "filter": filt,
-                "should": should,
-                "minimum_should_match": 0,
-            }
-        },
-    }
-    return q
-
-
-def is_excluded_id(cid: str, exclude_prefixes: List[str]) -> bool:
-    c = cid or ""
-    for p in exclude_prefixes:
-        if c.startswith(p):
-            return True
-    return False
-
-
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--in-eval", type=Path, default=Path("evalset.jsonl"))
     ap.add_argument("--out", type=Path, default=Path("evalset_labeled.jsonl"))
 
@@ -394,6 +284,13 @@ def main():
 
     ap.add_argument("--candidate-k", type=int, default=2000)
     ap.add_argument("--gold-k", type=int, default=10)
+
+    # Labeled pool controls
+    ap.add_argument("--label-pool-k", type=int, default=500, help="How many top teacher items to label (per query).")
+    ap.add_argument("--hard-neg-k", type=int, default=250, help="Add this many hard negatives to the labeled pool.")
+    ap.add_argument("--noise-down-p", type=float, default=0.0, help="Prob of demoting positives (>=2) by 1.")
+    ap.add_argument("--noise-up-p", type=float, default=0.0, help="Prob of promoting negatives (0) to 1.")
+
     ap.add_argument("--seed", type=int, default=0)
 
     ap.add_argument(
@@ -402,107 +299,167 @@ def main():
         default=[],
         help="Repeatable. Exclude IDs starting with these prefixes from gold (e.g., cr_gold_, cr_hard_).",
     )
+
+    # Linear reranker weights (optional)
+    ap.add_argument("--reranker", default=None, help="Optional path to reranker_weights.json")
+
+    # Teacher CE options
+    ap.add_argument(
+        "--teacher-ce-model",
+        default=None,
+        help="HF model id for cross-encoder teacher (e.g., cross-encoder/ms-marco-MiniLM-L-12-v2).",
+    )
+    ap.add_argument("--teacher-ce-rerank-k", type=int, default=200, help="Teacher CE reranks top-M from linear.")
+    ap.add_argument("--teacher-ce-batch-size", type=int, default=8)
+    ap.add_argument("--teacher-ce-max-length", type=int, default=256)
+    ap.add_argument("--teacher-ce-alpha", type=float, default=1.0, help="1.0=teacher uses CE only; 0.0=linear only.")
+    ap.add_argument("--teacher-ce-device", type=str, default="cpu", help="cpu (t3.large has no GPU).")
+
     args = ap.parse_args()
 
     exclude_prefixes = args.exclude_id_prefix or []
     if not exclude_prefixes:
         exclude_prefixes = EXCLUDE_ID_PREFIXES_DEFAULT
 
-    rnd = random.Random(args.seed)
-    now_utc = datetime.now(timezone.utc)
+    rnd = random.Random(int(args.seed))
 
     eval_items = load_jsonl(args.in_eval)
     client = make_client(args.opensearch_url, args.opensearch_user, args.opensearch_pass)
+
+    reranker = load_reranker(args.reranker)
+
+    # Pre-load teacher CE ONCE (cached inside get_cross_encoder too, but we trigger here so
+    # you see it loading once and not per query).
+    teacher_ce_model = args.teacher_ce_model
+    if teacher_ce_model:
+        _ = get_cross_encoder(
+            CrossEncoderConfig(
+                model_name=str(teacher_ce_model),
+                batch_size=int(args.teacher_ce_batch_size),
+                max_length=int(args.teacher_ce_max_length),
+                device=str(args.teacher_ce_device),
+            )
+        )
 
     out_lines = 0
     with args.out.open("w", encoding="utf-8") as f_out:
         for ex in eval_items:
             req = ex.get("request") or {}
-            pr = parse_request(req)
-
-            body = build_os_query(req, candidate_k=args.candidate_k)
-            res = client.search(index=args.index, body=body)
-            hits = (res.get("hits", {}) or {}).get("hits", []) or []
-
-            # Collect candidate profiles from OpenSearch hits
-            profiles: List[Dict[str, Any]] = []
-            for h in hits:
-                src = h.get("_source") or {}
-                cid = str(src.get("creator_id") or "")
-                if not cid:
-                    continue
-                profiles.append(src)
-
-            if not profiles:
-                # no candidates -> skip
+            desc = str(req.get("description") or "").strip()
+            if not desc:
                 continue
 
-            # Normalize engagement within candidate pool (query-local)
-            eng_raw = [compute_engagement_raw(p) for p in profiles]
-            eng01 = normalize01(eng_raw)
+            constraints = parse_constraints(req)
 
-            # Score each candidate with your heuristic
-            scored: List[Tuple[float, str, float]] = []  # (score, cid, graded_rel later)
-            scores_only: List[float] = []
-            ids_only: List[str] = []
+            # Build query using runtime definition
+            body = build_os_query_runtime(desc, constraints)
+            res = client.search(index=args.index, body=body, size=int(args.candidate_k))
+            hits = (res.get("hits", {}) or {}).get("hits", []) or []
+            if not hits:
+                continue
 
-            for i, p in enumerate(profiles):
-                cid = str(p.get("creator_id") or "")
-                s, _ = score_profile(p, pr, now_utc, eng01[i])
-                scores_only.append(s)
-                ids_only.append(cid)
+            request_meta = {
+                "languages": constraints.languages,
+                "country": constraints.country,
+            }
 
-            graded = to_graded_relevance(scores_only)
+            # Runtime linear scoring
+            linear_ranked_full = linear_score_hits(hits, request_meta=request_meta, reranker=reranker)
+            if not linear_ranked_full:
+                continue
 
-            # Sort by score desc, then shuffle ties a bit for stability
-            order = list(range(len(scores_only)))
-            rnd.shuffle(order)
-            order.sort(key=lambda j: scores_only[j], reverse=True)
+            # Build teacher ranked list
+            if teacher_ce_model:
+                teacher_ranked = teacher_rerank_with_ce(
+                    query=desc,
+                    linear_ranked=linear_ranked_full,
+                    ce_model=str(teacher_ce_model),
+                    ce_rerank_k=int(args.teacher_ce_rerank_k),
+                    ce_batch_size=int(args.teacher_ce_batch_size),
+                    ce_max_length=int(args.teacher_ce_max_length),
+                    ce_alpha=float(args.teacher_ce_alpha),
+                    ce_device=str(args.teacher_ce_device),
+                )
+                # teacher_ranked entries are dicts w/ creator_id + final_score
+                teacher_ids = [h["creator_id"] for h in teacher_ranked]
+                teacher_score = {h["creator_id"]: float(h.get("final_score", 0.0)) for h in teacher_ranked}
+            else:
+                # No CE teacher => teacher == linear
+                teacher_ids = [x["creator_id"] for x in linear_ranked_full]
+                teacher_score = {x["creator_id"]: float(x["linear_score"]) for x in linear_ranked_full}
 
-            # Build gold from top scoring REAL corpus ids only (exclude fixtures)
+            # GOLD = top teacher ids excluding fixtures
             gold_ids: List[str] = []
-            top_indices: List[int] = []
-            for j in order:
-                cid = ids_only[j]
+            for cid in teacher_ids:
                 if is_excluded_id(cid, exclude_prefixes):
                     continue
                 gold_ids.append(cid)
-                top_indices.append(j)
-                if len(gold_ids) >= args.gold_k:
+                if len(gold_ids) >= int(args.gold_k):
                     break
-
             if not gold_ids:
                 continue
 
-            # Relevance maps for gold only
-            # Relevance maps for gold only
-            # Relevance maps
-            # - relevance: keep the old 10..1 scale for GOLD only
-            relevance_10 = {ids_only[j]: float(args.gold_k - r) for r, j in enumerate(top_indices)}
+            # labeled pool = top teacher + hard negatives
+            label_pool_ids = _pick_label_pool(
+                rnd=rnd,
+                teacher_ranked=[{"creator_id": cid} for cid in teacher_ids],
+                linear_ranked=[{"creator_id": cid} for cid in [x["creator_id"] for x in linear_ranked_full]],
+                label_pool_k=int(args.label_pool_k),
+                hard_neg_k=int(args.hard_neg_k),
+            )
+            # Deduplicate and keep order
+            label_pool_ids = list(dict.fromkeys(label_pool_ids))
 
-            # - relevance_graded: label ALL candidates in the pool (so NDCG has real signal)
-            #   We already computed: graded = to_graded_relevance(scores_only)
-            relevance_graded = {ids_only[i]: float(graded[i]) for i in range(len(ids_only))}
+            # Scores in labeled pool (teacher scores)
+            pool_scores: List[float] = [float(teacher_score.get(cid, 0.0)) for cid in label_pool_ids]
+            graded = to_graded_relevance(pool_scores)
+
+            relevance_graded = {cid: float(graded[i]) for i, cid in enumerate(label_pool_ids)}
+            relevance_graded = apply_label_noise(
+                rnd=rnd,
+                rel_map=relevance_graded,
+                noise_down_p=float(args.noise_down_p),
+                noise_up_p=float(args.noise_up_p),
+            )
+
+            # Rank-based relevance for GOLD only (gold_k..1)
+            gold_k = int(args.gold_k)
+            relevance_10 = {cid: float(gold_k - i) for i, cid in enumerate(gold_ids)}
 
             out_obj = {
                 "request": req,
                 "gold": gold_ids,
                 "relevance": relevance_10,
-                "relevance_graded": relevance_graded,
+                "relevance_graded": relevance_graded,  # sparse, realistic labels
                 "meta": {
-                    "gold_k": args.gold_k,
-                    "candidate_k": args.candidate_k,
-                    "seed": args.seed,
                     "index": args.index,
+                    "candidate_k": int(args.candidate_k),
+                    "gold_k": int(args.gold_k),
+                    "label_pool_k": int(args.label_pool_k),
+                    "hard_neg_k": int(args.hard_neg_k),
+                    "noise_down_p": float(args.noise_down_p),
+                    "noise_up_p": float(args.noise_up_p),
+                    "seed": int(args.seed),
                     "excluded_prefixes": exclude_prefixes,
+                    "reranker": args.reranker,
+                    "teacher_ce_model": teacher_ce_model,
+                    "teacher_ce_rerank_k": int(args.teacher_ce_rerank_k),
+                    "teacher_ce_batch_size": int(args.teacher_ce_batch_size),
+                    "teacher_ce_max_length": int(args.teacher_ce_max_length),
+                    "teacher_ce_alpha": float(args.teacher_ce_alpha),
+                    "teacher_ce_device": str(args.teacher_ce_device),
+                    "scoring": "runtime_linear + optional_teacher_cross_encoder + hard_negs + label_noise",
+                    "labeled_pool_size": len(label_pool_ids),
                 },
             }
+
             f_out.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
             out_lines += 1
 
     print(
         f"Wrote {args.out} with {out_lines} queries "
-        f"(gold from OpenSearch candidates only; fixtures excluded)."
+        f"(teacher={'CE' if teacher_ce_model else 'linear'}, "
+        f"hard_negs={int(args.hard_neg_k)}, noise=({args.noise_down_p},{args.noise_up_p}))."
     )
 
 
