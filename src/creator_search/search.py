@@ -17,8 +17,8 @@ from .cross_encoder import (
 
 
 def build_os_query(description: str, c: Constraints) -> Dict[str, Any]:
-    filters = []
-    should = []
+    filters: List[Dict[str, Any]] = []
+    should: List[Dict[str, Any]] = []
 
     # Hard filter: min_followers only
     if c.min_followers > 0:
@@ -62,7 +62,7 @@ def retrieve_candidates(
     t0 = time.perf_counter()
     body = build_os_query(description, constraints)
     res = client.search(index=index, body=body, size=candidate_k)
-    hits = list(res["hits"]["hits"])
+    hits = list((res.get("hits", {}) or {}).get("hits", []) or [])
     t1 = time.perf_counter()
     return hits, {"t_retrieve_ms": (t1 - t0) * 1000.0}
 
@@ -75,13 +75,13 @@ def rerank_hits_linear(
     out: List[Dict[str, Any]] = []
     for h in hits:
         feats = build_feature_vector(h, request_meta=request_meta)
-        s = reranker.score(feats)
+        s = float(reranker.score(feats))
         exp = explain_linear(feats, reranker.weights)
         src = h.get("_source") or {}
         out.append(
             {
                 "creator_id": src.get("creator_id"),
-                "final_score": float(s),
+                "final_score": s,
                 "bm25_score": float(h.get("_score") or 0.0),
                 "explain": exp,
                 # keep source for CE stage
@@ -106,8 +106,8 @@ def search_topk(
     ce_batch_size: int = 16,
     ce_max_length: int = 256,
     ce_alpha: float = 1.0,
-    ce_device: str = "auto",   # NEW
-    ce_num_threads: int = 2,   # NEW (CPU)
+    ce_device: str = "auto",
+    ce_num_threads: int = 2,  # CPU only
 ) -> Dict[str, Any]:
     desc = str(request_obj.get("description") or "")
     reranker = load_reranker(reranker_path)
@@ -117,14 +117,17 @@ def search_topk(
         "country": constraints.country,
     }
 
+    # Retrieve
     hits, t_retrieve = retrieve_candidates(client, index, desc, constraints, candidate_k)
 
+    # Linear rerank
     t1 = time.perf_counter()
     ranked = rerank_hits_linear(hits, request_meta=request_meta, reranker=reranker)
     t2 = time.perf_counter()
 
     profiling: Dict[str, float] = {**t_retrieve, "t_linear_ms": (t2 - t1) * 1000.0}
 
+    # Optional CE stage
     if ce_model:
         t3 = time.perf_counter()
 
@@ -155,8 +158,8 @@ def search_topk(
     return {
         "top_k": top_k,
         "profiling": profiling,
-        "candidate_k": candidate_k,
-        "k": k,
+        "candidate_k": int(candidate_k),
+        "k": int(k),
         "ce_model": ce_model,
-        "ce_rerank_k": ce_rerank_k if ce_model else 0,
+        "ce_rerank_k": int(ce_rerank_k) if ce_model else 0,
     }

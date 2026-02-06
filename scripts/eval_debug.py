@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics as stats
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List, Tuple
 
 from opensearchpy import OpenSearch
@@ -28,18 +30,28 @@ def make_client() -> OpenSearch:
     )
 
 
+def percentile(xs: List[float], p: float) -> float:
+    xs = sorted(xs)
+    if not xs:
+        return 0.0
+    k = (len(xs) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    if f == c:
+        return xs[f]
+    return xs[f] + (xs[c] - xs[f]) * (k - f)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", default=INDEX_DEFAULT)
     ap.add_argument("--evalset", default="evalset_labeled.jsonl")
     ap.add_argument("--candidate-k", type=int, default=2000)
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--n", type=int, default=15)
+    ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--relevance-threshold", type=float, default=2.0)
-    ap.add_argument("--use-gold-as-rel", action="store_true")
-    ap.add_argument("--reranker", default=None)
 
-    # CE knobs
+    ap.add_argument("--reranker", default=None)
     ap.add_argument("--ce-model", default=None)
     ap.add_argument("--ce-rerank-k", type=int, default=100)
     ap.add_argument("--ce-batch-size", type=int, default=32)
@@ -51,16 +63,15 @@ def main() -> int:
     client = make_client()
     eval_lines = Path(args.evalset).read_text(encoding="utf-8").splitlines()
 
+    latencies: List[float] = []
     rows: List[Tuple[int, float, Dict[str, Any]]] = []
 
-    for line in eval_lines:
-        if not line.strip():
-            continue
+    for i, line in enumerate(eval_lines[: args.n]):
         ex = json.loads(line)
         req = ex["request"]
-        q = str(req.get("description") or "")
         constraints = parse_constraints(req)
 
+        t0 = perf_counter()
         res = search_topk(
             client=client,
             index=args.index,
@@ -75,35 +86,23 @@ def main() -> int:
             ce_max_length=args.ce_max_length,
             ce_alpha=args.ce_alpha,
         )
+        t1 = perf_counter()
+
+        latencies.append((t1 - t0) * 1000.0)
+
         pred = [r["creator_id"] for r in res.get("top_k", []) if r.get("creator_id")]
+        rel = ex.get("relevance_graded") or {}
+        rel_set = {cid for cid, g in rel.items() if float(g) >= args.relevance_threshold}
+        hits = sum(1 for cid in pred[: args.k] if cid in rel_set)
 
-        if args.use_gold_as_rel:
-            gold = ex.get("gold") or []
-            gold_set = set(gold)
-            hits = sum(1 for cid in pred[: args.k] if cid in gold_set)
-            ndcg = 0.0  # optional; not needed for debug ordering
-            miss = [cid for cid in gold if cid not in set(pred[: args.k])]
-        else:
-            rel = ex.get("relevance_graded") or ex.get("relevance") or {}
-            rel_set = {cid for cid, g in rel.items() if float(g) >= float(args.relevance_threshold)}
-            hits = sum(1 for cid in pred[: args.k] if cid in rel_set)
-            # quick ndcg proxy: average rel in top-k (cheap debug)
-            ndcg = sum(float(rel.get(cid, 0.0)) for cid in pred[: args.k]) / float(max(args.k, 1))
-            miss = [cid for cid in rel_set if cid not in set(pred[: args.k])][:10]
+        rows.append((hits, 0.0, {"q": req.get("description"), "pred": pred}))
 
-        rows.append((int(hits), float(ndcg), {"q": q, "pred": pred, "miss": miss}))
-
-    # Worst: lowest hits then lowest ndcg
-    rows.sort(key=lambda x: (x[0], x[1]))
-
-    print("WORST by hits then ndcg:\n")
-    for hits, nd, info in rows[: args.n]:
-        print("---")
-        print(f"q: {info['q']}")
-        print(f"hits: {hits} ndcg: {nd:.4f}")
-        print(f"top_ids: {info['pred'][:args.k]}")
-        print(f"miss_relevant: {info['miss']}")
-        print()
+    print("\nLATENCY (ms):")
+    print(f"mean={stats.mean(latencies):.2f}")
+    print(f"p50 ={percentile(latencies, 50):.2f}")
+    print(f"p95 ={percentile(latencies, 95):.2f}")
+    print(f"p99 ={percentile(latencies, 99):.2f}")
+    print(f"n   ={len(latencies)}")
 
     return 0
 

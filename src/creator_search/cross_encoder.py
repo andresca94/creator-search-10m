@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
-
 import time
 
 import torch
@@ -28,9 +27,9 @@ def _resolve_device(device: str) -> str:
     return "cpu"
 
 
-# Cache: include batch_size too (since cfg is frozen)
+# Cache: include batch_size too (cfg is frozen; key must reflect inference behavior)
+# key = (model_name, resolved_device, max_length, batch_size)
 _CE_CACHE: Dict[Tuple[str, str, int, int], "CrossEncoderReranker"] = {}
-# key = (model_name, device, max_length, batch_size)
 
 
 class CrossEncoderReranker:
@@ -106,10 +105,10 @@ def get_cross_encoder(cfg: CrossEncoderConfig) -> CrossEncoderReranker:
     if ce is None:
         ce = CrossEncoderReranker(
             CrossEncoderConfig(
-                model_name=cfg.model_name,
+                model_name=str(cfg.model_name),
                 batch_size=int(cfg.batch_size),
                 max_length=int(cfg.max_length),
-                device=dev,
+                device=str(dev),
                 num_threads=int(cfg.num_threads),
                 log_every_batches=int(cfg.log_every_batches),
             )
@@ -119,15 +118,16 @@ def get_cross_encoder(cfg: CrossEncoderConfig) -> CrossEncoderReranker:
 
 
 def _extract_source(hit: Dict[str, Any]) -> Dict[str, Any]:
+    # Most common shape in your pipeline: {"_source": {...}}
     src = hit.get("_source")
     if isinstance(src, dict) and src:
         return src
-    inner = hit.get("_source_doc") or hit.get("_raw_source") or hit.get("_os_source")
-    if isinstance(inner, dict) and inner:
-        return inner
-    inner2 = hit.get("source")
-    if isinstance(inner2, dict) and inner2:
-        return inner2
+
+    # Fallbacks if some wrappers exist
+    for k in ("_source_doc", "_raw_source", "_os_source", "source"):
+        inner = hit.get(k)
+        if isinstance(inner, dict) and inner:
+            return inner
     return {}
 
 
